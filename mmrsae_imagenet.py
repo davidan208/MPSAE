@@ -132,6 +132,8 @@ def build_parser():
     parser.add_argument("--query-batch-size", type=int, default=32)
     parser.add_argument("--gallery-chunk-size", type=int, default=65536)
     parser.add_argument("--score-buffer-mib", type=int, default=256)
+    parser.add_argument("--dense-gemm-min-k", type=int, default=256,
+                        help="Search budgets K >= this with blocked FP32 cuBLAS GEMM instead of the sparse index; 0 disables")
     parser.add_argument("--gpu-memory-fraction", type=float, default=.8)
     parser.add_argument("--faiss-temp-memory-mib", type=int, default=512)
     parser.add_argument("--retrieval-warmup", type=int, default=3)
@@ -174,7 +176,7 @@ def validate_args(args):
         raise ValueError("Legacy extraction requires a positive feature batch size and nonnegative workers")
     if not re.fullmatch(r"[\w.-]+/[\w.-]+", args.embeddings_repo) or not args.embeddings_revision.strip():
         raise ValueError("Embeddings repository must be owner/name, with a nonempty revision")
-    for name in ("max_steps", "seed", "data_seed", "train_size", "max_val", "eval_every",
+    for name in ("max_steps", "seed", "data_seed", "train_size", "max_val", "eval_every", "dense_gemm_min_k",
                  "k_aux", "dead_steps", "faiss_temp_memory_mib"):
         if getattr(args, name) < 0:
             raise ValueError(f"--{name.replace('_', '-')} must be nonnegative")
@@ -242,7 +244,7 @@ def retrieval_config(args):
             "score_buffer_mib": args.score_buffer_mib, "faiss_temp_memory_mib": args.faiss_temp_memory_mib,
             "gpu_memory_fraction": args.gpu_memory_fraction, "warmup": args.retrieval_warmup,
             "repeats": args.retrieval_repeats, "encode_batch_size": args.encode_batch_size,
-            "allow_empty_codes": args.allow_empty_codes}
+            "allow_empty_codes": args.allow_empty_codes, "dense_gemm_min_k": args.dense_gemm_min_k}
 
 
 def method_config(args, input_dim):
@@ -296,6 +298,26 @@ def write_log(path, value):
         stream.flush()
 
 
+def host_ram_mib():
+    """Resident anonymous memory of this process (heap/arrays, not mapped files or page cache)."""
+    try:
+        with open("/proc/self/status", encoding="ascii") as status:
+            for line in status:
+                if line.startswith("RssAnon:"):
+                    return int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    return -1
+
+
+def memory_status(device):
+    import torch
+    if torch.device(device).type != "cuda":
+        return f"RAM={host_ram_mib()}MiB"
+    return (f"GPU={torch.cuda.memory_allocated(device) / 2**20:.0f}MiB "
+            f"GPU_peak={torch.cuda.max_memory_allocated(device) / 2**20:.0f}MiB RAM={host_ram_mib()}MiB")
+
+
 def tensor_rows(features, ids, device):
     import numpy as np
     import torch
@@ -337,7 +359,11 @@ def evaluate(args, bundle, model, output, checkpoint_path, identity, step, *, de
                    "official validation; any tuning or repeated inspection of these scores must be disclosed"}
     budgets = [args.k] if dense or intermediate else evaluation_budgets(args, model.config.input_dim)
     per_topk = {}
+    device = next(model.parameters()).device
     for k in budgets:
+        print(f"Retrieval {args.variant} K={k}: encoding {len(bundle.gallery_ids):,} gallery + "
+              f"{len(bundle.query_ids):,} queries, then searching ({memory_status(device)})", flush=True)
+        started = time.perf_counter()
         config = {"protocol": PROTOCOL, "model": {"input_dim": model.config.input_dim,
                   "hidden_dim": args.hidden_dim, "k": k}, "retrieval": retrieval_config(args)}
         target = directory if dense else directory / f"k_{k}"
@@ -348,6 +374,10 @@ def evaluate(args, bundle, model, output, checkpoint_path, identity, step, *, de
             timed=args.timed_retrieval and not intermediate)
         result.update(metadata)
         atomic_json(target / "result.json", result)
+        print(f"Retrieval {args.variant} K={k}: top1={result['top1']:.2f}% "
+              f"backend={result.get('index', {}).get('backend', '?')} {time.perf_counter() - started:.0f}s "
+              f"({memory_status(device)})",
+              flush=True)
         if not dense:
             per_topk[str(k)] = result
             # Persist completed points even if a later budget fails or the job stops.
@@ -634,11 +664,13 @@ def fit_and_evaluate(args, backbone, bundle, output, code, gpu, *, failure_conte
                 if next_step % args.log_every == 0 or next_step == total:
                     torch.cuda.synchronize(device)
                     row.update({"gpu_allocated_mib": torch.cuda.memory_allocated(device) / 2**20,
-                                "gpu_peak_allocated_mib": torch.cuda.max_memory_allocated(device) / 2**20})
+                                "gpu_peak_allocated_mib": torch.cuda.max_memory_allocated(device) / 2**20,
+                                "host_ram_mib": host_ram_mib()})
                     log_wandb_metrics("train", row, step_metric="step")
                     print(f"{backbone} {args.variant} K={row['training_k']} target_K={args.k} update={next_step}/{total} "
                           f"loss={row['loss_total']:.6f} nnz_min={row['final_nnz_min']} "
-                          f"zero_codes={row['zero_final_codes']} GPU={row['gpu_allocated_mib']:.0f}MiB", flush=True)
+                          f"zero_codes={row['zero_final_codes']} GPU={row['gpu_allocated_mib']:.0f}MiB "
+                          f"RAM={row['host_ram_mib']}MiB", flush=True)
                 at_epoch_end = next_step % per_epoch == 0
                 if next_step % args.checkpoint_every == 0 or at_epoch_end or next_step == total:
                     save(next_step)

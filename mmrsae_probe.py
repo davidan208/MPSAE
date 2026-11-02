@@ -24,16 +24,54 @@ from repair_runtime import epoch_batches, load_checkpoint, save_checkpoint
 PROBE_PROTOCOL = "frozen-linear-probe-v1"
 
 
+def _rows(array, positions, device, dtype):
+    if isinstance(array, torch.Tensor):
+        if not isinstance(positions, slice):
+            positions = torch.as_tensor(positions, device=array.device)
+        return array[positions].to(dtype)
+    return torch.as_tensor(np.array(array[positions], dtype=torch.empty((), dtype=dtype).numpy().dtype,
+                                    copy=True), device=device)
+
+
+def resident_codes(codes, device, reserve_bytes=2 << 30):
+    """Copy compact codes to the GPU once when they fit beside a reserve.
+
+    Minibatches then gather on the GPU instead of reading random rows of the
+    disk map, which is CPU/IO-bound for 1.28M rows. Batch order is unchanged.
+    Codes that do not fit stay mapped and use the original path.
+    """
+    device = torch.device(device)
+    names = [name for name in ("values", "indices") if name in codes]
+    if device.type != "cuda" or isinstance(codes[names[0]], torch.Tensor):
+        return codes
+    need = sum(codes[name].size * codes[name].dtype.itemsize for name in names)
+    torch.cuda.empty_cache()  # release the finished retrieval index's cached blocks
+    free, _ = torch.cuda.mem_get_info(device)
+    if need > free - reserve_bytes:
+        return codes
+    resident = {}
+    for name in names:
+        array = codes[name]
+        target = None
+        for start in range(0, len(array), 65536):
+            chunk = torch.from_numpy(np.array(array[start:start + 65536], copy=True))
+            if target is None:
+                target = torch.empty(array.shape, dtype=chunk.dtype, device=device)
+            target[start:start + len(chunk)].copy_(chunk)
+        resident[name] = target
+    return resident
+
+
 def code_batch(codes, positions, width, device):
     """Expand one compact batch; retain original dictionary coordinate IDs."""
-    values = torch.as_tensor(np.array(codes["values"][positions], dtype=np.float32, copy=True), device=device)
+    values = _rows(codes["values"], positions, device, torch.float32)
     if not bool(torch.isfinite(values).all()):
         raise ValueError("Nonfinite probe features")
     if "indices" not in codes:
         if values.ndim != 2 or values.shape[1] != width:
             raise ValueError("Dense probe feature width changed")
         return values
-    indices = torch.as_tensor(np.array(codes["indices"][positions], dtype=np.int64, copy=True), device=device)
+    indices = _rows(codes["indices"], positions, device, torch.int64)
     if indices.shape != values.shape or bool((indices < 0).any()) or bool((indices >= width).any()):
         raise ValueError("Invalid compact probe coordinates")
     return values.new_zeros((len(values), width)).scatter_(1, indices, values)
@@ -64,6 +102,8 @@ def fit_linear_probe(train_codes, train_labels, query_codes, query_labels, *, wi
             raise ValueError("Probe labels outside the declared class range")
     train_labels = train_labels.astype(np.int64, copy=False)
     query_labels = query_labels.astype(np.int64, copy=False)
+    train_codes = resident_codes(train_codes, device)
+    query_codes = resident_codes(query_codes, device)
     # nn.Linear's default initializer consumes RNG; create it in a private fork.
     with torch.random.fork_rng(devices=[]):
         head = nn.Linear(width, num_classes)
@@ -95,7 +135,7 @@ def fit_linear_probe(train_codes, train_labels, query_codes, query_labels, *, wi
         head.train()
         for _, rows in epoch_batches(positions, seed, epoch, batch_size):
             batch = code_batch(train_codes, rows, width, device)
-            targets = torch.as_tensor(train_labels[rows], device=device)
+            targets = torch.as_tensor(np.ascontiguousarray(train_labels[rows]), device=device)
             optimizer.zero_grad(set_to_none=True)
             loss = F.cross_entropy(head(batch), targets)
             if not bool(torch.isfinite(loss)):
@@ -117,7 +157,7 @@ def fit_linear_probe(train_codes, train_labels, query_codes, query_labels, *, wi
         for start in range(0, len(query_labels), batch_size):
             rows = slice(start, start + batch_size)
             logits = head(code_batch(query_codes, rows, width, device))
-            targets = torch.as_tensor(query_labels[rows], device=device)
+            targets = torch.as_tensor(np.ascontiguousarray(query_labels[rows]), device=device)
             correct += int(logits.argmax(dim=1).eq(targets).sum())
     return {"top1": 100. * correct / len(query_labels), "correct": correct,
             "total": len(query_labels), "train_examples": len(train_labels),
@@ -134,7 +174,7 @@ def evaluate_linear_probes(args, bundle, model, output, checkpoint_identity):
     encoding cache. The parent classifier is included even when dense-parent
     retrieval is disabled; it streams features without a resident dense index.
     """
-    from mmrsae_imagenet import evaluation_budgets, retrieval_config
+    from mmrsae_imagenet import evaluation_budgets, memory_status, retrieval_config
     from repair_benchmark import _encoded_cache
 
     device = next(model.parameters()).device
@@ -199,7 +239,7 @@ def evaluate_linear_probes(args, bundle, model, output, checkpoint_identity):
                     None, config, cache_root, encoding_identity, "training_gallery", device)
                 queries, query_meta = _encoded_cache(query_features, query_ids, None if dense else model.sae,
                     None, config, cache_root, encoding_identity, query_role, device)
-            print(f"Linear probe {args.variant} K={key}", flush=True)
+            print(f"Linear probe {args.variant} K={key} ({memory_status(device)})", flush=True)
             point = fit_linear_probe(train, train_labels, queries, targets,
                 width=model.config.input_dim if dense else model.config.hidden_dim,
                 num_classes=classes, device=device, epochs=args.probe_epochs,

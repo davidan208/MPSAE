@@ -10,6 +10,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import statistics
@@ -171,6 +172,11 @@ def _encoded_cache(features, row_ids, sae, repair, config, cache_root, identity,
         start_event = torch.cuda.Event(enable_timing=True)
         initial_event = torch.cuda.Event(enable_timing=True)
         final_event = torch.cuda.Event(enable_timing=True)
+        # msync/fsync scan the whole mapping, so syncing every batch makes large
+        # galleries CPU-bound. Commit the resume cursor about every 512 MiB.
+        row_bytes = width * (8 if sparse else 4) + (4 if sparse else 0)
+        commit_rows = max(encode_batch, (512 << 20) // max(1, row_bytes))
+        committed = reused_rows
         for first in range(reused_rows, len(row_ids), encode_batch):
             last = min(first + encode_batch, len(row_ids))
             torch.cuda.synchronize(device)
@@ -207,9 +213,10 @@ def _encoded_cache(features, row_ids, sae, repair, config, cache_root, identity,
             state["correction_seconds"] += initial_event.elapsed_time(final_event) / 1000.
             state["encoding_cuda_seconds"] += start_event.elapsed_time(final_event) / 1000.
             state["encoding_wall_seconds"] += time.perf_counter() - wall_start
-            _flush_maps(maps, directory)
-            state["completed_rows"] = last
-            atomic_json(manifest_path, state)
+            if last - committed >= commit_rows or last == len(row_ids):
+                _flush_maps(maps, directory)
+                state["completed_rows"] = committed = last
+                atomic_json(manifest_path, state)
         if "array_fingerprints" not in state:
             state["array_fingerprints"] = {
                 name: {"bytes": (directory / f"{name}.npy").stat().st_size,
@@ -269,6 +276,47 @@ def _resident_encoding_measurement(features, ids, sae, repair, k, batch_size, de
 def _numpy_rows(array, start, stop, device, dtype):
     # Copy avoids handing PyTorch a writable view of a read-only mapped array.
     return torch.as_tensor(np.array(array[start:stop], copy=True), device=device, dtype=dtype).contiguous()
+
+
+def _dense_rows(codes, start, stop, dim, device):
+    """Expand compact rows to dictionary width on the GPU (top-k indices are distinct)."""
+    values = _numpy_rows(codes["values"], start, stop, device, torch.float32)
+    indices = _numpy_rows(codes["indices"], start, stop, device, torch.int64)
+    return values.new_zeros((len(values), dim)).scatter_(1, indices, values)
+
+
+DENSE_GEMM_GALLERY_CHUNK = 32768
+DENSE_GEMM_QUERY_BLOCK = 8192
+
+
+def _dense_gemm_search(gallery, queries, dim, device):
+    """Exact max-inner-product top-1 by blocked FP32 cuBLAS GEMM.
+
+    Queries stay dense and resident; the compact gallery is read once in
+    order, expanded per chunk on the GPU and multiplied against every query
+    block. Cost is independent of K, unlike posting-list accumulation, whose
+    products grow with K^2. Ties keep the lowest gallery position.
+    """
+    query_count, gallery_count = len(queries["values"]), len(gallery["values"])
+    dense_queries = torch.empty((query_count, dim), dtype=torch.float32, device=device)
+    for first in range(0, query_count, DENSE_GEMM_QUERY_BLOCK):
+        last = min(first + DENSE_GEMM_QUERY_BLOCK, query_count)
+        dense_queries[first:last] = _dense_rows(queries, first, last, dim, device)
+    best = torch.full((query_count,), -math.inf, dtype=torch.float32, device=device)
+    positions = torch.zeros(query_count, dtype=torch.int64, device=device)
+    torch.cuda.synchronize(device)
+    started = time.perf_counter()
+    for start in range(0, gallery_count, DENSE_GEMM_GALLERY_CHUNK):
+        stop = min(start + DENSE_GEMM_GALLERY_CHUNK, gallery_count)
+        chunk = _dense_rows(gallery, start, stop, dim, device)
+        for first in range(0, query_count, DENSE_GEMM_QUERY_BLOCK):
+            last = min(first + DENSE_GEMM_QUERY_BLOCK, query_count)
+            value, position = (dense_queries[first:last] @ chunk.T).max(dim=1)
+            better = value > best[first:last]
+            best[first:last] = torch.where(better, value, best[first:last])
+            positions[first:last] = torch.where(better, position + start, positions[first:last])
+    torch.cuda.synchronize(device)
+    return best, positions, time.perf_counter() - started
 
 
 def _parameter_bytes(module):
@@ -346,6 +394,10 @@ def benchmark(features, labels, gallery_ids, query_ids, sae, repair, config,
     cache_root = output_dir.parent / "encoded_cache"
     sparse = sae is not None
     k = int(config["model"]["k"]) if sparse else features.shape[1]
+    # Large budgets are nearly dense; blocked GEMM beats posting accumulation.
+    dense_gemm_min_k = int(settings.get("dense_gemm_min_k", 0))
+    dense_gemm = sparse and dense_gemm_min_k > 0 and k >= dense_gemm_min_k
+    timed = timed and not dense_gemm
     modes = []
     for module in (sae, repair):
         if module is not None:
@@ -384,7 +436,16 @@ def benchmark(features, labels, gallery_ids, query_ids, sae, repair, config,
             backend_setup_seconds = time.perf_counter() - setup_start
             torch.cuda.synchronize(device)
             build_start = time.perf_counter()
-            if sparse:
+            if dense_gemm:
+                dim = int(sae.decoder.shape[0])
+                gemm_best, gemm_positions, gemm_seconds = _dense_gemm_search(gallery, queries, dim, device)
+                index_info = {"backend": "cuda_dense_gemm_fp32", "index_bytes": 0,
+                              "dense_query_bytes": 4 * len(query_ids) * dim,
+                              "gallery_chunk_rows": DENSE_GEMM_GALLERY_CHUNK,
+                              "query_block_rows": DENSE_GEMM_QUERY_BLOCK,
+                              "search_seconds": gemm_seconds,
+                              "search_scope": "gallery upload and expansion plus all GEMM blocks, single pass"}
+            elif sparse:
                 width = int(gallery["values"].shape[1])
                 score_bytes = int(settings.get("score_buffer_mib", 256)) * 2**20
                 index = CudaSparseIndex(int(sae.decoder.shape[0]), device, max_score_buffer_bytes=score_bytes,
@@ -445,6 +506,10 @@ def benchmark(features, labels, gallery_ids, query_ids, sae, repair, config,
                         empty = values.norm(dim=1).le(0).cpu().numpy()
                         if not bool(torch.isfinite(values).all()) or (not allow_empty and empty.any()):
                             raise ValueError("Invalid cached sparse query")
+                    if dense_gemm:
+                        products += (last - first) * len(gallery_ids) * int(sae.decoder.shape[0])
+                        search = lambda: (gemm_best[first:last], gemm_positions[first:last])
+                    elif sparse:
                         products += index.query_product_count(indices, values)
                         search = lambda: index.search(indices, values)
                     else:
@@ -526,7 +591,11 @@ def benchmark(features, labels, gallery_ids, query_ids, sae, repair, config,
                                 "sparse_padded_payload_bytes_per_row": 8 * k + 4,
                                 "sparse_product_count": products,
                                 "sparse_product_fraction_of_dense_dictionary": products / (len(query_ids) * len(gallery_ids) * int(sae.decoder.shape[0]))})
-            if timer is None:
+            if dense_gemm:
+                metrics["search_backend"] = "cuda_dense_gemm_fp32"
+                metrics["screening_search_wall_seconds"] = gemm_seconds
+                metrics["search_measurement_scope"] = "single_dense_gemm_pass_including_gallery_upload"
+            elif timer is None:
                 metrics["screening_search_wall_seconds"] = screening_search_seconds
                 metrics["search_measurement_scope"] = "single_accuracy_pass_no_warm_repeated_performance_claim"
             else:
