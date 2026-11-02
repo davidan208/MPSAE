@@ -165,7 +165,8 @@ class MultiBudgetEvaluationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="mk_") as directory:
             root = Path(directory)
             result, calls, model = self.evaluate_fixture(root)
-            self.assertEqual([item[0] for item in calls], [2, 4, 8, 16])
+            # Largest budget first, so the most memory-hungry point fails early.
+            self.assertEqual([item[0] for item in calls], [16, 8, 4, 2])
             self.assertTrue(all(item[1] is model.sae for item in calls))
             self.assertEqual(set(result["per_topk"]), {"2", "4", "8", "16"})
             self.assertEqual(result["top1"], result["per_topk"]["8"]["top1"])
@@ -175,9 +176,9 @@ class MultiBudgetEvaluationTests(unittest.TestCase):
 
     def test_interrupted_sweep_keeps_completed_budgets(self):
         with tempfile.TemporaryDirectory(prefix="mk_") as directory:
-            result, _, _ = self.evaluate_fixture(Path(directory), fail_at=16)
+            result, _, _ = self.evaluate_fixture(Path(directory), fail_at=2)
             self.assertFalse(result["complete"])
-            self.assertEqual(set(result["per_topk"]), {"2", "4", "8"})
+            self.assertEqual(set(result["per_topk"]), {"16", "8", "4"})
 
 
 class ReportingTests(unittest.TestCase):
