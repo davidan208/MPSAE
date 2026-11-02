@@ -219,7 +219,8 @@ def evaluate_linear_probes(args, bundle, model, output, checkpoint_identity):
     prior_mode = model.training
     model.eval()
     try:
-        for k in [*budgets, None]:
+        # Largest budget first (as in retrieval); the parent classifier runs last.
+        for k in [*sorted(budgets, reverse=True), None]:
             key = str(k) if k is not None else "full_parent"
             already_complete = key in result["per_topk"] if k is not None else result["full_parent"] is not None
             if already_complete:

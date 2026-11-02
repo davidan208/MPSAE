@@ -360,7 +360,8 @@ def evaluate(args, bundle, model, output, checkpoint_path, identity, step, *, de
     budgets = [args.k] if dense or intermediate else evaluation_budgets(args, model.config.input_dim)
     per_topk = {}
     device = next(model.parameters()).device
-    for k in budgets:
+    # Largest budget first: the most memory-hungry point fails early, not after hours.
+    for k in sorted(budgets, reverse=True):
         print(f"Retrieval {args.variant} K={k}: encoding {len(bundle.gallery_ids):,} gallery + "
               f"{len(bundle.query_ids):,} queries, then searching ({memory_status(device)})", flush=True)
         started = time.perf_counter()
