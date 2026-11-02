@@ -2,18 +2,22 @@
 set -Eeuo pipefail
 
 # One manually configured MMRSAE fit per selected ImageNet backbone.
-# This direct launcher also accepts an explicit ENV_FILE; the Docker
-# launcher loads .env by default. Explicit CLI options appear last and override
-# environment-derived values. No eval/string-built argument expansion.
+# Settings come from ENV_FILE, else .env beside this script when present.
+# Explicit CLI options appear last and override environment-derived values.
+# No eval/string-built argument expansion.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/experiment_shell_common.sh"
-load_experiment_env
+load_experiment_env .env
 select_experiment_python
 wandb_mode="${WANDB_MODE:-}"
 if [[ -z "$wandb_mode" ]]; then
     if [[ -n "${WANDB_API_KEY:-}" ]]; then wandb_mode=online; else wandb_mode=offline; fi
 fi
 
+# Defaults are the full official benchmark: all training rows, 10 epochs,
+# the 50k official validation queries, inference K=2..width, linear probes.
+# .env normally holds only HF_TOKEN and WANDB_*; any MMRSAE_* there overrides.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 embeddings_dir="${MMRSAE_EMBEDDINGS:-$SCRIPT_DIR/data/embeddings}"
 cache_dir="${MMRSAE_CACHE:-$SCRIPT_DIR/data/mmrsae}"
 args=(
@@ -21,12 +25,12 @@ args=(
     --k "${MMRSAE_K:-8}"
     --eval-topk "${MMRSAE_EVAL_TOPK:-auto}"
     --epochs "${MMRSAE_EPOCHS:-10}"
-    --max-steps "${MMRSAE_MAX_STEPS:-500}"
+    --max-steps "${MMRSAE_MAX_STEPS:-0}"
     --batch-size "${MMRSAE_BATCH_SIZE:-1024}"
-    --train-size "${MMRSAE_TRAIN_SIZE:-128000}"
+    --train-size "${MMRSAE_TRAIN_SIZE:-0}"
     --dev-size "${MMRSAE_DEV_SIZE:-10000}"
     --anchor-count "${MMRSAE_ANCHOR_COUNT:-1024}"
-    --evaluation "${MMRSAE_EVALUATION:-dev}"
+    --evaluation "${MMRSAE_EVALUATION:-official}"
     --seed "${MMRSAE_SEED:-1227}"
     --data-seed "${MMRSAE_DATA_SEED:-42}"
     --device "${MMRSAE_DEVICE:-cuda:0}"
@@ -64,7 +68,7 @@ optional_options=(
     MMRSAE_CONTRASTIVE_WEIGHT:--contrastive-weight MMRSAE_CONTRASTIVE_TEMPERATURE:--contrastive-temperature
     MMRSAE_ENCODE_BATCH_SIZE:--encode-batch-size
     MMRSAE_QUERY_BATCH_SIZE:--query-batch-size MMRSAE_GALLERY_CHUNK_SIZE:--gallery-chunk-size
-    MMRSAE_SCORE_BUFFER_MIB:--score-buffer-mib MMRSAE_GPU_MEMORY_FRACTION:--gpu-memory-fraction
+    MMRSAE_SCORE_BUFFER_MIB:--score-buffer-mib MMRSAE_DENSE_GEMM_MIN_K:--dense-gemm-min-k MMRSAE_GPU_MEMORY_FRACTION:--gpu-memory-fraction
     MMRSAE_FAISS_TEMP_MEMORY_MIB:--faiss-temp-memory-mib
     MMRSAE_RETRIEVAL_WARMUP:--retrieval-warmup MMRSAE_RETRIEVAL_REPEATS:--retrieval-repeats
     MMRSAE_MAX_VAL:--max-val
