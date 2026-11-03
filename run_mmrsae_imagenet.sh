@@ -121,7 +121,7 @@ esac
 
 # Run the four selected methods unless a list or single variant is specified.
 # An explicit CLI --variant takes precedence and runs exactly once.
-IFS=',' read -r -a variants <<< "${MMRSAE_VARIANTS:-${MMRSAE_VARIANT:-csr,csrv2,dlmmsae,dlmmsaev2}}"
+IFS=',' read -r -a variants <<< "${MMRSAE_VARIANTS:-${MMRSAE_VARIANT:-csr,csrv2,mpsae,mpsaev2}}"
 # Planning/preparation modes fit nothing, so they produce no report.
 report_dir="${MMRSAE_OUTPUT:-$SCRIPT_DIR/runs/mmrsae}"
 make_report="${MMRSAE_REPORT:-1}"
@@ -142,10 +142,10 @@ selected_variants=()
 declare -A seen_variants=()
 for variant in "${variants[@]}"; do
     variant="${variant// /}"
-    [[ "$variant" != "dlmmsae-annealed" ]] || variant=dlmmsaev2
+    [[ "$variant" != "mpsae-annealed" ]] || variant=mpsaev2
     case "$variant" in
-        csr|csrv2|dlmmsae|dlmmsaev2) ;;
-        *) echo "Unsupported benchmark method '$variant'; choose csr,csrv2,dlmmsae,dlmmsaev2" >&2; exit 2 ;;
+        csr|csrv2|mpsae|mpsaev2) ;;
+        *) echo "Unsupported benchmark method '$variant'; choose csr,csrv2,mpsae,mpsaev2" >&2; exit 2 ;;
     esac
     [[ -z "${seen_variants[$variant]:-}" ]] || { echo "Duplicate benchmark method: $variant" >&2; exit 2; }
     seen_variants[$variant]=1

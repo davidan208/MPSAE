@@ -24,31 +24,32 @@ _BASH = str(_MSYS_BASH) if os.name == "nt" and _MSYS_BASH.exists() else shutil.w
 
 class SelectedBenchmarkTests(unittest.TestCase):
     def test_cli_and_report_select_only_the_four_final_methods(self):
-        expected = ("csr", "csrv2", "dlmmsae", "dlmmsaev2")
+        expected = ("csr", "csrv2", "mpsae", "mpsaev2")
         self.assertEqual(BENCHMARK_METHODS, expected)
         self.assertEqual(runner.VARIANTS, expected)
         self.assertEqual(reporting.METHODS, expected)
         parser = runner.build_parser()
-        self.assertEqual(parser.parse_args([]).variant, "dlmmsae")
-        for method in ("mmrsae", "mmrsae-rel", "mmrsae-wide", "mmrsae-annealed", "mpsae"):
+        self.assertEqual(parser.parse_args([]).variant, "mpsae")
+        for method in ("mmrsae", "mmrsae-rel", "mmrsae-wide", "mmrsae-annealed", "dlmmsae", "dlmmsaev2"):
             with self.subTest(method=method), contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
                     parser.parse_args(["--variant", method])
 
     def test_old_name_is_canonicalized_before_config_and_plan_serialization(self):
-        old = MMRSAEConfig(input_dim=6, hidden_dim=128, variant="dlmmsae-annealed")
-        new = MMRSAEConfig(input_dim=6, hidden_dim=128, variant="dlmmsaev2")
+        old = MMRSAEConfig(input_dim=6, hidden_dim=128, variant="mpsae-annealed")
+        new = MMRSAEConfig(input_dim=6, hidden_dim=128, variant="mpsaev2")
         self.assertEqual(old.to_dict(), new.to_dict())
-        self.assertEqual(old.variant, "dlmmsaev2")
+        self.assertEqual(old.variant, "mpsaev2")
         output = io.StringIO()
         with mock.patch("mmrsae_data.prepare_imagenet_features", side_effect=AssertionError("data opened")), \
                 mock.patch("torch.cuda.init", side_effect=AssertionError("CUDA initialized")), \
                 contextlib.redirect_stdout(output):
-            self.assertEqual(runner.main(["--plan", "--variant", "dlmmsae-annealed"]), 0)
+            self.assertEqual(runner.main(["--plan", "--variant", "mpsae-annealed"]), 0)
         plan = json.loads(output.getvalue())
-        self.assertEqual(plan["variant"], "dlmmsaev2")
-        self.assertEqual(plan["settings"]["variant"], "dlmmsaev2")
-        self.assertTrue(plan["context_distillation"])
+        self.assertEqual(plan["variant"], "mpsaev2")
+        self.assertEqual(plan["settings"]["variant"], "mpsaev2")
+        self.assertFalse(plan["context_distillation"])
+        self.assertEqual(plan["sparsity_schedule"]["type"], "fixed-main-linear-ot")
 
     def test_v2_budgets_match_the_original_csrv2_formula_at_every_step(self):
         # Execute only the actual reference function, without importing the
@@ -106,11 +107,11 @@ class LauncherSelectionTests(unittest.TestCase):
 
     def test_explicit_cli_selection_overrides_list_once_in_both_forms(self):
         selection = ",".join(BENCHMARK_METHODS)
-        self.assertEqual(self.variants(self.launch("--variant", "dlmmsaev2", selection=selection)), ["dlmmsaev2"])
-        self.assertEqual(self.variants(self.launch("--variant=dlmmsae-annealed", selection=selection)), ["dlmmsaev2"])
+        self.assertEqual(self.variants(self.launch("--variant", "mpsaev2", selection=selection)), ["mpsaev2"])
+        self.assertEqual(self.variants(self.launch("--variant=mpsae-annealed", selection=selection)), ["mpsaev2"])
 
     def test_unsupported_list_is_rejected_before_any_method_runs(self):
-        result = self.launch(selection="csr,mmrsae,dlmmsae")
+        result = self.launch(selection="csr,dlmmsae,mpsae")
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stdout, "")
         self.assertIn("Unsupported benchmark method", result.stderr)

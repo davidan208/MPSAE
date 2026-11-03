@@ -1,11 +1,11 @@
 """Names shared by the selected ImageNet benchmark, CLI and CPU reports."""
 
-BENCHMARK_METHODS = ("csr", "csrv2", "dlmmsae", "dlmmsaev2")
+BENCHMARK_METHODS = ("csr", "csrv2", "mpsae", "mpsaev2")
 METHOD_LABELS = {"csr": "CSR", "csrv2": "CSRv2",
-                 "dlmmsae": "DLMMSAE", "dlmmsaev2": "DLMMSAEv2"}
+                 "mpsae": "MPSAE", "mpsaev2": "MPSAEv2"}
 # Read existing ablation results and accept the former spelling as input.
 # New configurations, trial names and result rows always use the v2 name.
-METHOD_ALIASES = {"dlmmsae-annealed": "dlmmsaev2"}
+METHOD_ALIASES = {"mpsae-annealed": "mpsaev2", "dlmmsae-annealed": "dlmmsaev2"}
 
 
 def canonical_method(name):

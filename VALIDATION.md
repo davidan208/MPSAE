@@ -1,3 +1,33 @@
+# MPSAE fixed-main benchmark update: 3 November 2026
+
+The main Docker benchmark now selects CSR, CSRv2, MPSAE and MPSAEv2 through the
+same Compose service, scope `mmrsae`, scripts, `MMRSAE_*` controls and output/data
+paths. The protocol is `mmrsae-imagenet-mpsae-fixed-main-v5`; code/recipe identities
+prevent silently resuming incompatible DLMMSAE or earlier v2 checkpoints.
+
+MPSAEv2 implements the supplied image: `R_K* + 2*gap(z_K*,z_2ka(t),z_4ka(t))`,
+with linear `ka(t)=round(K0-(K0-K*)*t/Ta)` before Ta and K* afterward,
+`Ta=max(1,ceil(fraction*T))`. Main K*, wide reconstruction 4K* and dead-neuron
+loss/activity stay fixed. CSRv2 retains its existing main-K cosine schedule.
+
+The **138-test CPU suite passed** in the existing `machinelearning` environment.
+Seven new integration checks cover the exact schedule and boundary cases, actual
+view tensors and independently composed objective, a single shared encoder
+preactivation, fixed reconstruction/dead loss/activity across annealing, endpoint
+loss and gradient equivalence to fixed MPSAE, width caps and true-OT-view gradient
+diagnostics, exact Adam continuation across the linear boundary, and plain-SAE
+preflight memory routing. Existing checks cover library methods, reporting, input
+I/O, frozen classification, OT safety and Bash method selection. MSYS Bash/tests
+used permitted execution outside the Windows sandbox.
+
+`docker compose config --quiet` and filtered resolved-configuration checks passed
+with the existing local configuration. Bash syntax checks passed for the three
+main launchers; template and local `.env` plan routes all selected the four new
+methods and the fixed-main linear-OT policy for MPSAEv2.
+No Docker build, container restart, ImageNet fitting, download or CUDA benchmark
+was started. Full GPU runtime, accuracy and cost measurements remain server
+validation. The entries below record earlier implementations and protocols.
+
 # Validation status for MMRSAE and the repair research profile
 
 The November 2, 2026 selected-comparison update limits the benchmark and

@@ -42,13 +42,13 @@ class OverviewDataTests(unittest.TestCase):
             return {"method": method, "backbone": backbone, "K": k, "top1": top1,
                     "training_gpu_hours": hours, "training_time_scope": "updates_and_key_refresh",
                     "training_device_name": "same GPU"}
-        rows = [point("dlmmsae", "resnet50", 8, 70., 3.), point("dlmmsae", "resnet18", 8, 50., 1.),
+        rows = [point("mpsae", "resnet50", 8, 70., 3.), point("mpsae", "resnet18", 8, 50., 1.),
                 point("csr", "resnet50", 8, 60.), point("csr", "resnet18", 16, 55.),
                 point("mmrsae", "resnet50", 8, 62.), point("mmrsae", "resnet18", 8, 58., None)]
         compute = reporting.compute_rows(rows)
         averages = [row for row in compute if row["aggregation"] == "macro_accuracy_sum_compute"]
         self.assertEqual(len(averages), 1)
-        self.assertEqual(averages[0]["method"], "dlmmsae")
+        self.assertEqual(averages[0]["method"], "mpsae")
         self.assertEqual(averages[0]["K"], 8)
         self.assertEqual(averages[0]["top1"], 60.)
         self.assertEqual(averages[0]["training_gpu_hours"], 4.)
@@ -59,12 +59,12 @@ class OverviewDataTests(unittest.TestCase):
         self.assertEqual(reporting.compute_rows(rows), [])
 
     def test_new_method_styles_are_distinct_and_stable(self):
-        self.assertIn("dlmmsae", reporting.METHODS)
-        self.assertIn("dlmmsaev2", reporting.METHODS)
+        self.assertIn("mpsae", reporting.METHODS)
+        self.assertIn("mpsaev2", reporting.METHODS)
         self.assertEqual(len(set(reporting._style(method) for method in reporting.METHODS)), len(reporting.METHODS))
 
     def test_classification_and_retrieval_use_independent_values_and_dimensions(self):
-        point = {"method": "dlmmsae", "backbone": "resnet50", "K": 8, "top1": 62.,
+        point = {"method": "mpsae", "backbone": "resnet50", "K": 8, "top1": 62.,
                  "classification_top1": 74., "classification_actual_nnz_mean": 7.25,
                  "actual_nnz_mean": 6.5, "full_parent_top1": 72., "full_parent_classification_top1": 80.}
         plt = reporting._pyplot()
@@ -107,15 +107,15 @@ class OverviewReportTests(unittest.TestCase):
     def test_hardware_changes_split_comparison_groups(self):
         with tempfile.TemporaryDirectory(prefix="overview_") as directory:
             root = Path(directory)
-            self.fixture(root, "dlmmsae", hardware="GPU A")
+            self.fixture(root, "mpsae", hardware="GPU A")
             self.fixture(root, "csr", hardware="GPU B")
             self.assertEqual(len(reporting.collect(root)), 2)
 
     def test_report_renders_all_requested_views_and_exports_measured_numbers(self):
         with tempfile.TemporaryDirectory(prefix="overview_") as directory:
             root = Path(directory)
-            self.fixture(root, "dlmmsae")
-            self.fixture(root, "dlmmsaev2")
+            self.fixture(root, "mpsae")
+            self.fixture(root, "mpsaev2")
             with contextlib.redirect_stdout(io.StringIO()):
                 result = reporting.report(root)
             group = next(iter(result.values()))
@@ -154,19 +154,20 @@ class OverviewReportTests(unittest.TestCase):
     def test_only_selected_methods_are_reported_and_old_annealed_name_is_readable(self):
         with tempfile.TemporaryDirectory(prefix="overview_") as directory:
             root = Path(directory)
-            for method in ("csr", "csrv2", "dlmmsae", "dlmmsae-annealed",
-                           "mmrsae", "mmrsae-rel", "mmrsae-wide", "mmrsae-annealed", "mpsae"):
+            for method in ("csr", "csrv2", "mpsae", "mpsae-annealed",
+                           "mmrsae", "mmrsae-rel", "mmrsae-wide", "mmrsae-annealed", "dlmmsae", "dlmmsaev2", "dlmmsae-annealed"):
                 self.fixture(root, method)
             group = next(iter(reporting.collect(root).values()))
-            self.assertEqual(set(group["trials"]), {"csr", "csrv2", "dlmmsae", "dlmmsaev2"})
+            self.assertEqual(set(group["trials"]), {"csr", "csrv2", "mpsae", "mpsaev2"})
             rows = reporting.budget_rows(group)
             self.assertEqual({row["method"] for row in rows}, set(reporting.METHODS))
             self.assertEqual(len(rows), 4 * 2 * 3)
             self.assertTrue(all(row["top1"] == 60. + row["K"] / 100 for row in rows))
-            source = json.loads((root / "dlmmsae-annealed/trial.json").read_text())
-            self.assertEqual(source["settings"]["variant"], "dlmmsae-annealed")
-            self.assertEqual(reporting._label("dlmmsaev2"), "DLMMSAEv2")
+            source = json.loads((root / "mpsae-annealed/trial.json").read_text())
+            self.assertEqual(source["settings"]["variant"], "mpsae-annealed")
+            self.assertEqual(reporting._label("mpsaev2"), "MPSAEv2")
             self.assertEqual(reporting._label("csrv2"), "CSRv2")
+            self.assertEqual(json.loads((root / "dlmmsae-annealed/trial.json").read_text())["settings"]["variant"], "dlmmsae-annealed")
 
 
 if __name__ == "__main__":

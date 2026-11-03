@@ -199,7 +199,12 @@ def auxiliary_budget(k, hidden_dim, step, total_steps, mode="baseline"):
 
 def reconstruction_terms(sae, x, k, aux_budget=None, *, repair=None,
                          mask_generator=None, mask=False, update_activity=True,
-                         k_aux=512, clean_probability=.2, erase_probability=.25):
+                         k_aux=512, clean_probability=.2, erase_probability=.25,
+                         ot_budgets=None):
+    if ot_budgets is not None:
+        if (len(ot_budgets) != 2 or any(isinstance(v, bool) or not isinstance(v, int)
+                or v < 1 for v in ot_budgets) or repair is not None or mask):
+            raise ValueError("Separate OT budgets require two positive integers and a clean plain SAE")
     pre = sae.preactivations(x)
     dictionary_first = bool(getattr(sae, "dictionary_first", False))
     raw = {name: sae.keep_topk(pre, budget) for name, budget in
@@ -279,6 +284,14 @@ def reconstruction_terms(sae, x, k, aux_budget=None, *, repair=None,
                   "tail_ratio_4k_mean": tail_4k[alive].mean() if bool(alive.any()) else head.new_zeros(()),
                   "encoder_bias_mean": sae.encoder_bias.detach().mean()})
     raw.update({"final_k": small, "final_2k": medium, "raw_auxiliary": wide})
+    if ot_budgets is not None:
+        # All views share this preactivation. Fixed reconstruction/activity
+        # views above are unchanged, including the dead-neuron auxiliary.
+        width = pre.shape[1]
+        raw["ot_2k"] = (raw["raw_2k"] if min(ot_budgets[0], width) == min(2*k, width)
+                        else sae.keep_topk(pre, ot_budgets[0]))
+        raw["ot_4k"] = (raw["raw_4k"] if min(ot_budgets[1], width) == min(4*k, width)
+                        else sae.keep_topk(pre, ot_budgets[1]))
     return total, stats, raw
 
 
@@ -790,16 +803,24 @@ def research_loss(sae, x, k, *, repair=None, mask=False, mask_generator=None,
                   microbatch=32, require_feasible=True, max_refine_iters=2000,
                   diagnostics=False, update_activity=True, k_aux=512,
                   clean_probability=.2, erase_probability=.25, anchor_chunk_size=128,
-                  allow_empty_codes=False):
+                  allow_empty_codes=False, ot_budgets=None):
     """``allow_empty_codes`` keeps training through all-zero final codes, as
     the original MPSAE runner does; their count is reported, the objective is
     unchanged (an all-zero view has zero normalized direction in the OT cost)."""
     if mixture_weight != 0:
         raise ValueError("Repair/MMRSAE training uses angular OT only; mixture_weight must be 0")
+    if ot_budgets is not None and relation_weight:
+        raise ValueError("Separate OT budgets are only supported without landmark KL")
     reconstruction, stats, views = reconstruction_terms(sae, x, k, auxiliary_budget,
         repair=repair, mask=mask, mask_generator=mask_generator, update_activity=update_activity,
-        k_aux=k_aux, clean_probability=clean_probability, erase_probability=erase_probability)
-    for name in ("final_k", "final_2k", "raw_4k"):
+        k_aux=k_aux, clean_probability=clean_probability, erase_probability=erase_probability,
+        ot_budgets=ot_budgets)
+    ot_names = ("final_k", "final_2k", "raw_4k") if ot_budgets is None else ("final_k", "ot_2k", "ot_4k")
+    width = sae.decoder.shape[0]
+    stats.update(ot_view_k=min(k, width),
+                 ot_view_2k=min(2*k if ot_budgets is None else ot_budgets[0], width),
+                 ot_view_4k=min(4*k if ot_budgets is None else ot_budgets[1], width))
+    for name in ot_names:
         z = views[name]
         if not bool(torch.isfinite(z).all()):
             raise ValueError(f"invalid final code in {name}")
@@ -820,8 +841,8 @@ def research_loss(sae, x, k, *, repair=None, mask=False, mask_generator=None,
             relation = relational_kl(profiles)
     components = {"reconstruction": reconstruction, "relation": relation_weight*relation}
     if ot_weight:
-        gap, solver_stats, context = mixed_matching_gap(views["final_k"], views["final_2k"],
-              views["raw_4k"], mixture_weight=0., mass=mass,
+        gap, solver_stats, context = mixed_matching_gap(*(views[name] for name in ot_names),
+              mixture_weight=0., mass=mass,
               eta=eta, max_iters=max_iters, tol=tol, microbatch=microbatch,
               require_feasible=require_feasible, max_refine_iters=max_refine_iters, diagnostics=diagnostics)
         cost_fields = {"cost0_mean", "costnbr_mean", "costmix_std", "cost0_min", "cost0_max",
@@ -842,7 +863,7 @@ def research_loss(sae, x, k, *, repair=None, mask=False, mask_generator=None,
     views["component_losses"] = components
     views["profiles"] = profiles
     if diagnostics:
-        stats.update(gradient_diagnostics(components, views))
+        stats.update(gradient_diagnostics(components, views, view_names=ot_names))
         raw_support = views["raw_k"].gt(0)
         final_support = views["final_k"].gt(0)
         stats["support_change_rate"] = (~raw_support.eq(final_support).all(1)).float().mean()
@@ -850,9 +871,11 @@ def research_loss(sae, x, k, *, repair=None, mask=False, mask_generator=None,
     return total, stats, views
 
 
-def gradient_diagnostics(components, views, threshold=1e-10):
-    """Common tensor space includes raw 4K, whose new-cost derivative is zero."""
-    tensors = [views[name] for name in ("final_k", "final_2k", "raw_4k")]
+def gradient_diagnostics(components, views, threshold=1e-10, *,
+                         view_names=("final_k", "final_2k", "raw_4k")):
+    """Inspect the actual OT views, including independent auxiliary budgets."""
+    tensors = [views[name] for name in view_names]
+    budget_names = [name.removeprefix("final_") for name in view_names]
     selected = [tensor.detach().gt(0) for tensor in tensors]
     records = {}
     for name, loss in components.items():
@@ -862,7 +885,7 @@ def gradient_diagnostics(components, views, threshold=1e-10):
         selected_count = sum(mask.sum() for mask in selected).clamp_min(1)
         small_count = sum((grad.abs().le(threshold) & mask).sum() for grad, mask in zip(grads, selected))
         records[f"gradient_{name}_selected_near_zero_fraction"] = small_count/selected_count
-        for budget_name, grad, mask in zip(("k", "2k", "raw_4k"), grads, selected):
+        for budget_name, grad, mask in zip(budget_names, grads, selected):
             records[f"gradient_{name}_{budget_name}_norm"] = grad.norm()
             records[f"gradient_{name}_{budget_name}_selected_near_zero_fraction"] = (
                 (grad.abs().le(threshold) & mask).sum()/mask.sum().clamp_min(1))

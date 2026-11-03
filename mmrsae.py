@@ -35,8 +35,8 @@ from mpsae_repair import (
 VARIANTS = ("mmrsae", "mmrsae-rel", "mmrsae-wide", "mmrsae-annealed", "dlmmsae", "dlmmsaev2")
 # Historical ablations remain available to the library; the benchmark CLI is
 # restricted to mmrsae_methods.BENCHMARK_METHODS.
-# Comparison methods without repair: MPSAE, fixed-K CSR and cosine-annealed CSRv2.
-BASELINES = ("mpsae", "csr", "csrv2")
+# Plain-SAE methods: MPSAE/MPSAEv2, fixed-K CSR and cosine-annealed CSRv2.
+BASELINES = ("mpsae", "mpsaev2", "csr", "csrv2")
 METHODS = VARIANTS + BASELINES
 
 
@@ -50,6 +50,25 @@ def cosine_annealed_k(step, total_steps, start_k, target_k, anneal_fraction=.7):
     progress = step / (anneal_steps - 1)
     cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
     value = target_k + (start_k - target_k) * cosine_decay
+    return min(start_k, max(target_k, int(round(value))))
+
+
+def linear_ot_annealed_k(step, total_steps, start_k, target_k, anneal_fraction=.7):
+    """MPSAEv2 auxiliary OT budget; reconstruction stays at target_k.
+
+    Ta = max(1, ceil(fraction * total_steps)); use round(K0-(K0-K*)*t/Ta)
+    before Ta, then K*. Unlike CSRv2, this never schedules the main gate.
+    """
+    if total_steps < 1 or step < 0:
+        raise ValueError("total_steps must be positive and step nonnegative")
+    if not 1 <= target_k <= start_k:
+        raise ValueError("Require 1 <= target_k <= start_k")
+    if not math.isfinite(anneal_fraction) or not 0 < anneal_fraction <= 1:
+        raise ValueError("anneal_fraction must be in (0,1]")
+    anneal_steps = max(1, math.ceil(total_steps * anneal_fraction))
+    if step >= anneal_steps:
+        return target_k
+    value = start_k - (start_k - target_k) * step / anneal_steps
     return min(start_k, max(target_k, int(round(value))))
 
 
@@ -77,7 +96,7 @@ class MMRSAEConfig:
     """Resolved, serializable settings for exactly one MMRSAE fit.
 
     ``None`` means use the selected variant's default, rather than ignoring an
-    explicit zero. Baselines (``mpsae``, ``csr``, ``csrv2``) have no repair,
+    explicit zero. Plain-SAE methods (``mpsae``, ``mpsaev2``, ``csr``, ``csrv2``) have no repair,
     masking or landmark KL. All enabled OT objectives use angular cost only.
     ``allow_empty_codes`` (default) follows the original MPSAE runner: an
     all-zero final code does not stop training; it is counted and reported.
@@ -222,6 +241,12 @@ class MMRSAEConfig:
                                      self.k, self.anneal_fraction)
         return self.k
 
+    def ot_annealing_k(self, step, total_steps):
+        if self.variant == "mpsaev2":
+            return linear_ot_annealed_k(step, total_steps, self.anneal_start_k,
+                                       self.k, self.anneal_fraction)
+        return self.training_k(step, total_steps)
+
 
 class MMRSAE(nn.Module):
     """One reusable MMRSAE encoder, objective and checkpoint state.
@@ -333,6 +358,7 @@ class MMRSAE(nn.Module):
         cfg = self.config
         k = cfg.training_k(step, total_steps)
         budget = auxiliary_budget(k, cfg.hidden_dim, step, total_steps, cfg.auxiliary_mode)
+        ot_k = cfg.ot_annealing_k(step, total_steps)
         if cfg.variant in ("csr", "csrv2"):
             result = self._csr_loss(x, budget, k=k, diagnostics=diagnostics, update_activity=update_activity)
             result[1]["training_k"] = k
@@ -348,8 +374,11 @@ class MMRSAE(nn.Module):
             update_activity=update_activity, k_aux=cfg.k_aux,
             clean_probability=cfg.clean_probability, erase_probability=cfg.erase_probability,
             anchor_chunk_size=cfg.anchor_chunk_size, allow_empty_codes=cfg.allow_empty_codes,
+            ot_budgets=(2 * ot_k, 4 * ot_k) if cfg.variant == "mpsaev2" else None,
         )
         result[1]["training_k"] = k
+        if cfg.variant == "mpsaev2":
+            result[1]["annealing_k"] = ot_k
         if self.needs_dictionary:
             result[1]["dictionary_blend"] = self.sae.dictionary.blend_logit.sigmoid().detach()
         if self.needs_context:

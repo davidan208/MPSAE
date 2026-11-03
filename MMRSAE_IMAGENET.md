@@ -1,128 +1,107 @@
-**DLMMSAE / CSR: selected ImageNet benchmark**
+**MPSAE / CSR: selected ImageNet benchmark**
 
-MMRSAE names the current method family: a landmark dictionary synthesizes a
-contextual embedding before a tied sparse autoencoder applies Top-K. There is
-no post-SAE residual repair. Training uses reconstruction, landmark KL and
-angular partial OT. Its public
-implementation is [mmrsae.py](mmrsae.py). The current
-runner is [mmrsae_imagenet.py](mmrsae_imagenet.py); the original MPSAE baseline,
-strict paper studies, and staged repair study retain their historical names.
+The main Docker experiment now benchmarks `csr`, `csrv2`, `mpsae` and
+`mpsaev2`. The single-method Python default is `mpsae`; templates and the
+launcher select all four methods. Existing commands, Docker service, scope
+`mmrsae`, `MMRSAE_*` environment names, output/data paths, probes and retrieval
+remain the same. Rebuild the image to include changed source:
 
-The Python runner trains **one chosen variant at one target K and one seed for each
-of ResNet-50 and ResNet-18, sequentially**, then evaluates each checkpoint at
-multiple inference budgets. The launcher and environment templates run four methods:
-`csr`, `csrv2`, `dlmmsae`, and `dlmmsaev2` (CSR, CSRv2, DLMMSAE, DLMMSAEv2).
-The benchmark CLI only selects these methods; its single-method default is
-`dlmmsae`. `dlmmsae-annealed` remains an input/read alias for `dlmmsaev2`.
-Reports include only this four-method comparison and label old annealed results
-as DLMMSAEv2 without modifying their stored files. Earlier ablation methods
-remain in the model library for archival use.
-It runs only ImageNet. It does not
-start the transfer suite, a parameter sweep, attribution arms, or promotion
-gates. Parameters are set by hand and recorded with each run. This is an
-exploratory experiment, not a strict reproduction or a claim of improvement.
-
-**Validation scope.** Prepared-embedding I/O has CPU checks for local/offline
-loading, targeted Hub downloads, checksum reuse, direct NPZ mapping and split
-boundaries. Full ImageNet fitting and Docker/CUDA retrieval still require
-server validation. See [VALIDATION.md](VALIDATION.md) for the check record.
-
-**Landmark dictionary before SAE.** Let A contain fixed training-only landmark
-features, D have shape h by d, and H_K^+ retain the K largest signed scores
-followed by ReLU. The current MMRSAE path is
-
-```text
-q = x + ReLU(x U) V
-w = softmax(cosine(q, A) / dictionary_temperature)
-context = w A
-blend = sigmoid(blend_logit)
-x_dict = x + blend * (context - x)
-a = (x_dict - b_pre) D.T + b_enc
-z_K = H_K^+(a)
-x_hat = z_K D + b_pre                 # reconstruction target is original x
+```bash
+docker compose up -d --build
+docker compose logs -f --tail 100 imagenet
 ```
 
-The query adapter U/V uses a rank-32 bottleneck by default; U starts random
-and V starts at zero. Temperature defaults to 0.1. The trainable blend starts
-at 0.1, so the synthesis initially mixes 90% original embedding with 10%
-landmark context. This direct input path avoids replacing x outright with a
-landmark barycenter; it is not an information-preservation guarantee. There is
-no alpha calibration or IHT step. The final code has at most K positive values.
+For a plan that starts no downloads, GPU work or fitting:
 
-The fixed landmark features and IDs are initialized from training anchors and
-saved in the model checkpoint. Cosine lookup normalizes features, while the
-context uses their original values. Main synthesis lookup uses all landmarks
-consistently in training and inference. The runner reserves A outside fitting,
-gallery and development queries, including when `--train-size 0` selects every
-eligible fitting row. Official queries come from a separate validation source.
-The public dictionary API can additionally exclude a supplied row ID for the
-DLMMSAE auxiliary lookup; the held-out-A experiment policy already prevents
-self matches in its main training and inference paths.
-
-All clean budgets use the same SAE preactivation vector a after landmark
-synthesis. Therefore clean K/2K/4K/auxiliary supports are nested, including when
-each inference budget is encoded separately. During fitting, masking applies
-to the full dense positive SAE activations before the final projection:
-20% of rows are forced clean; in the remaining rows each positive coefficient
-is erased independently with probability 0.25, without rescaling. One masked
-activation vector is shared by the K and 2K views; 4K and the auxiliary
-reconstruction view use clean activations. The masked views need not nest
-inside the clean 4K view. Inference and KL-bank refresh use clean activations.
-
-The input reaches landmark synthesis before any Top-K operation. The fixed
-landmark dictionary is required at inference, adding model-buffer memory and
-query-to-landmark lookup cost. The separate KL code bank and OT solver are
-training-only. Encoding/training cost must be measured; the architecture
-change itself establishes no accuracy or speed advantage.
-The historical `RepairModule` and staged `EXPERIMENT_SCOPE=repair` study retain
-their sparse-start architecture. They are separate from this current runner.
-
-The selected benchmark methods are:
-
-| Variant | Sparse representation and training K | Neighborhood KL | Transport | Auxiliary reconstruction budget B |
-|---|---|---|---|---|
-| `csr` (baseline) | Plain tied SAE; CSR NCL (gamma 0.1 for ResNet-50, 1.0 for ResNet-18, temperature 0.2) | Disabled | Disabled | min(h, 4K), raw scores |
-| `csrv2` (baseline) | CSR with half-cosine training-K annealing, then fixed target K | Disabled | Disabled | 4 times the current training K |
-| `dlmmsae` | Landmark-first SAE plus direct raw-context relational distillation; fixed training K | Enabled, plus context KL over separate Q | Angular cost only | min(h, 4K) |
-| `dlmmsaev2` | DLMMSAE with the same CSRv2 half-cosine training-K formula | Enabled, plus context KL over separate Q | Angular cost only | min(h, 4K(t)) |
-
-The CSR baselines share the SAE initialization, optimizer, data order, target budget
-and endpoint retrieval with DLMMSAE. They serve the plain Top-K code.
-DLMMSAE adds computation and parameters, so equal update counts do not mean equal
-compute budgets. Report encoding time and fitting cost alongside accuracy.
-
-**DLMMSAE context objective.** [dlmmsae.py](dlmmsae.py) implements a separate
-training reference bank Q. By default it contains 1,024 deterministic fitting
-rows, sampled with data-seed stream 9131, disjoint from the synthesis bank A.
-The runner requires at least three references so a query belonging to Q still
-has two alternatives after excluding itself. Both teacher and student use
-the same ordered references and the same row-specific exclusion mask:
-
-```text
-x_tilde = x + context_noise_std * RMS(x) * normal_noise
-c = synthesis(x_tilde; A)              # raw context, before blend and SAE
-p_teacher = softmax(cosine(stop_gradient(x), Q) / context_teacher_temperature)
-p_context = softmax(cosine(c, Q) / context_student_temperature)
-L_context = mean KL(stop_gradient(p_teacher) || p_context)
-L_DLMMSAE = L_reconstruction + relation_weight * L_sparse_KL
-           + context_weight * L_context + ot_weight * L_angular_OT
+```bash
+python mmrsae_imagenet.py --plan --variant mpsae
+python mmrsae_imagenet.py --plan --variant mpsaev2
+ENV_FILE=mmrsae.env.example bash run_mmrsae_imagenet.sh --plan
 ```
 
-Noise affects only the auxiliary lookup query; the reconstruction target,
-teacher, main SAE path and inference stay clean apart from the existing
-pre-Top-K training mask. This is feature perturbation, not image augmentation.
-Defaults are context weight 1, both context temperatures 0.1, and noise standard
-deviation 0.02 relative to each input row's RMS. Weight 0 disables this component
-for an explicit ablation; existing methods default to 0 and reject a nonzero
-context weight. Q and A contain fixed original embeddings, so their keys do
-not require a momentum encoder or a FIFO queue. Q is training-only, while A
-remains part of inference.
+This is an exploratory ImageNet comparison. One target-K model is fitted per
+method/backbone and evaluated at multiple inference budgets. The strict historical
+CSR/MPSAE studies and transfer recipes remain separate. DLMMSAE and landmark-first
+MMRSAE remain library methods; the active CLI and reports exclude them, and saved
+DLMMSAE results are not relabeled or modified.
 
-The auxiliary gradient reaches the query adapter even when the blend is near
-zero or Top-K has no active units. It does not constrain the blend to stay
-positive, guarantee useful context, or establish an accuracy improvement.
-DLMMSAE logs context KL, teacher entropy, context-to-input cosine, context norm,
-self exclusions and, in diagnostics, the context adapter gradient norm.
+**Shared plain SAE and MPSAE objective.** All selected methods use:
+
+```text
+a = (x - b_pre) D.T + b_enc
+z_k = TopK_then_ReLU(a)
+x_hat_k = z_k D + b_pre
+R_K = MSE(x_hat_K, x) + MSE(x_hat_4K, x)/8 + dead_auxiliary_loss/32
+```
+
+The dictionary is the learned SAE matrix D, not a bank of input landmarks.
+There is no context synthesis, activation masking, sparse KL or context KL in
+these selected models. Code values are nonnegative, with at most k positives.
+The original dead-neuron objective, its budget 512, activity updates and threshold
+30 are unchanged. Auxiliary dead-neuron reconstruction and wide reconstruction
+are separate branches.
+
+| Method | Objective | Main/reconstruction sparsity | OT views |
+|---|---|---|---|
+| `csr` | `R_K + gamma*NCL` | Fixed K | None |
+| `csrv2` | `R_K(t) + gamma*NCL` | Existing half-cosine main-K schedule | None |
+| `mpsae` | `R_K + 2*L_OT` | Fixed K and wide 4K | K,2K,4K |
+| `mpsaev2` | `R_K* + 2*L_OT` | Fixed K* and wide 4K* throughout | K*,2k_a(t),4k_a(t) |
+
+CSR NCL uses two deterministic copies of normalized K codes, temperature 0.2,
+and gamma 0.1 for RN50 or 1.0 for RN18. MPSAE uses the existing angular partial
+matching gap, with default weight 2, transported mass .9, entropy .2, OT groups
+of at most 32, initial/refinement iteration bounds 100/2000 and tolerance 1e-4.
+The solver is detached; the cost receives the matching-gap gradient. The 2K view
+has no additional reconstruction loss.
+
+**MPSAEv2 implements the supplied fixed-main, linear auxiliary schedule.** Let
+K* be the target inference sparsity. At every step:
+
+$$
+L_t = R_{K_*} + 2 L_{OT}(z_{K_*}, z_{2k_a(t)}, z_{4k_a(t)}).
+$$
+
+All views share one encoder preactivation. Main reconstruction always uses K*,
+wide reconstruction always uses 4K*, and dead-neuron loss/activity stay fixed to
+the original target-K MPSAE recipe. Only the two auxiliary OT views anneal.
+With zero-based update t and total update count T, define
+`T_a=max(1,ceil(anneal_fraction*T))` and:
+
+$$
+k_a(t) =
+\begin{cases}
+\operatorname{round}\left(K_0-(K_0-K_*)t/T_a\right), & t<T_a,\\
+K_*, & t\ge T_a.
+\end{cases}
+$$
+
+The rounding is Python `round`; budgets are capped by SAE width when encoding.
+`MMRSAE_ANNEAL_START_K` sets K0 (default `min(h,max(64,4K*))` in Python; template
+sets 64). `MMRSAE_ANNEAL_FRACTION` defaults to .7. At T=500, K*=8, K0=64, Ta=350:
+
+| Step t | Main K* | k_a(t) | Second OT budget | Third OT budget | Wide reconstruction |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 8 | 64 | 128 | 256 | 32 |
+| 175 | 8 | 36 | 72 | 144 | 32 |
+| 350 onward | 8 | 8 | 16 | 32 | 32 |
+
+At ka=K*, the loss and gradients match fixed-K MPSAE for identical model state.
+CSRv2 retains its existing cosine schedule; MPSAEv2 does not anneal the main gate.
+When fraction=1, the mathematical endpoint is t=T (just after the final zero-based
+training update); when T=1, its sole update uses K0. `mpsae-annealed` aliases
+`mpsaev2`. Historical MPSAEv2 implementations in other runners retain their original
+recipes and must not be conflated with this fixed-main version.
+
+Training logs keep `training_k=K*`, report `annealing_k`, `ot_view_k`,
+`ot_view_2k`, `ot_view_4k` and fixed `auxiliary_budget`. Diagnostics measure the
+actual auxiliary OT views, and plots distinguish main K, ka, OT views and wide
+reconstruction. New protocol `mmrsae-imagenet-mpsae-fixed-main-v5` plus source
+identity prevents resuming DLMMSAE or earlier incompatible v2 checkpoints as this
+recipe. Data allocation retains the previous held-out anchor reservation for
+identical split settings across methods; plain models do not load a synthesis or
+context bank for serving. Changing the benchmark does not establish an accuracy
+or compute improvement.
 
 **All-zero codes.** The final Top-K/ReLU can produce fewer than K positive
 coefficients or an empty code. A zero final code receives no gradient through
@@ -131,7 +110,7 @@ does not make the full OT matching gap zero; three all-zero views have angular
 cost 2/3 under the implemented normalization. As in
 the original MPSAE runner, `--allow-empty-codes` (default; `MMRSAE_ALLOW_EMPTY_CODES=1`)
 does not stop on such codes and does not change any objective: they keep a zero
-direction in the OT cost and zero cosine to landmarks, stay zero rows in the
+direction in the OT cost and stay zero rows in the
 retrieval index, and an empty query is recorded as a miss. Training logs
 `final_nnz_min`, `final_nnz_below_k_fraction`, `final_zero_code_fraction`,
 `raw_kth_preactivation_nonpositive_fraction`, `tail_ratio_2k_mean`,
@@ -155,7 +134,7 @@ and PDF figures. The overview contains:
 | `top1_vs_retrieval_ms` | 1-NN accuracy vs warm GPU search time per query batch; K labels at markers; excludes encoding |
 | `top1_vs_gpu_hours_<backbones>` | 1-NN vs measured representation-training GPU-hours at each K; combined panels use macro accuracy and summed hours over the same backbones |
 | `top1_by_method` | Endpoint accuracy at the configured training target K |
-| `training_loss`, `dictionary_and_schedule`, `support_health` | Reconstruction/context losses, blend, annealing K and sparse-code health |
+| `training_loss`, `sparsity_schedule`, `support_health` | Reconstruction/OT/NCL losses, fixed main K, auxiliary OT budgets and sparse-code health |
 
 Full-representation retrieval references require `MMRSAE_DENSE_REFERENCE=1`
 (`--dense-reference`) and enough GPU memory for the dense gallery. Full-parent
@@ -187,7 +166,7 @@ now select identical loss components.
 capped by dictionary width. The training target K is always included. A custom
 list such as `MMRSAE_EVAL_TOPK=2,4,8,16,32,64,128,256,512` is accepted, with
 every value required to be between 1 and h. Each point re-encodes both gallery
-and queries at that budget, including landmark synthesis for MMRSAE variants.
+and queries at that budget, using the plain SAE for all selected methods.
 
 These curves evaluate one checkpoint per method/backbone; they do not train
 independent models for each K. `top1_by_k.png/.pdf` plots inference K against
@@ -196,37 +175,14 @@ include both training K and inference K. Unmeasured budgets are never filled
 with copied accuracy. Completed points survive an interrupted evaluation.
 Intermediate epoch evaluations still measure only the training target K.
 
-`csrv2` and `dlmmsaev2` call the same function implementing CSRv2's half-cosine training-K schedule
-over the first 70% of updates by default:
-`MMRSAE_ANNEAL_START_K=64` to the target `MMRSAE_K=8`, followed by a fixed phase.
-An unset start uses min(h,max(64,4K)). With A=max(1,ceil(fraction*total_updates)),
-zero-based update t uses the rounded value
-`target_K + (start_K-target_K)*(1+cos(pi*t/(A-1)))/2` until t=A-1, then target K.
-When A=1 the target budget applies immediately. This is actual training-K
-annealing, matching the CSRv2 strategy. Learning rate stays fixed; B follows
-the current training K rather than having an independent annealing formula.
-
-For example, target K=8 and start K=64 give main K(t)=64->8, intermediate
-2K(t)=128->16 and clean 4K(t)=256->32, capped by h. The default auxiliary
-reconstruction budget is also B(t)=min(h,4K(t)). Landmark keys at K(t) and
-2K(t) refresh whenever K changes, in addition to periodic refreshes. Diagnostics
-and resumed training use keys at the same budget as their loss. Console and
-scalar logs distinguish current training K from target K. Endpoint inference
-continues to use the requested evaluation budgets.
-
-For current MMRSAE variants, every view is projected from SAE activations after
-landmark synthesis. Main K and intermediate 2K share the masked dense activations
-during fitting; the third transport view and auxiliary reconstruction use clean scores.
-The wide budget replaces the existing reconstruction branch with weight 1/8;
-it does not add a second wide reconstruction term. There is no separate 2K MSE.
-The dead-feature reconstruction term retains weight 1/32; its `k_aux` is a
-separate budget from B. MMRSAE variants produce clean landmark-first codes
-for both gallery and query at each requested inference budget; baselines
-produce plain SAE codes. Masking,
-KL profiles and transport are training work. The fixed input landmark
-dictionary is also used during inference and is carried in the checkpoint.
-There is no transport solver in retrieval. Manual weight and masking overrides
-are recorded separately from the preset name.
+CSRv2 retains the half-cosine **main-K** schedule from 64 to the target over
+70% of updates by default. Its reconstruction budget follows 4K(t). MPSAEv2
+instead uses the **linear auxiliary-OT** schedule specified above; its main K*
+and wide reconstruction 4K* remain fixed. Both use a fixed compressor learning
+rate. Inference uses the requested evaluation budget, independent of training
+schedule. The plain encoder needs no input landmark dictionary at inference.
+The dead-feature auxiliary keeps weight 1/32 and budget k_aux=512. The existing
+wide reconstruction keeps weight 1/8; no separate 2K MSE is added.
 
 `cost0_min/max` and the legacy-named `costmix_min/max` now both report the
 angular cost range. Solver feasibility/refinement and negative-gap checks stay
@@ -264,8 +220,8 @@ bash run_mmrsae_imagenet.sh --plan
 ENV_FILE=mmrsae.local.env bash run_mmrsae_imagenet.sh --plan
 bash run_mmrsae_imagenet.sh --preflight-only
 bash run_mmrsae_imagenet.sh --prepare-only
-bash run_mmrsae_imagenet.sh --backbones resnet18 --variant dlmmsaev2 \
-  --k 16 --lr 4e-5 --max-steps 500 --run-name rn18_dlmmsaev2_k16
+bash run_mmrsae_imagenet.sh --backbones resnet18 --variant mpsaev2 \
+  --k 16 --lr 4e-5 --max-steps 500 --run-name rn18_mpsaev2_k16
 ```
 
 These are usage examples, not commands executed during implementation. The
@@ -278,17 +234,17 @@ require the CUDA retrieval check. No CPU execution mode is provided.
 | Manual setting | Default | Interpretation |
 |---|---|---|
 | `MMRSAE_BACKBONES` / `--backbones` | `resnet50,resnet18` | Comma-separated selected architectures |
-| `MMRSAE_VARIANT` / `--variant` | `dlmmsae` | Single selected method; CLI override runs exactly once |
-| `MMRSAE_VARIANTS` | `csr,csrv2,dlmmsae,dlmmsaev2` | Launcher comparison list, run sequentially |
+| `MMRSAE_VARIANT` / `--variant` | `mpsae` | Single selected method; CLI override runs exactly once |
+| `MMRSAE_VARIANTS` | `csr,csrv2,mpsae,mpsaev2` | Launcher comparison list, run sequentially |
 | `MMRSAE_K` / `--k` | 8 | Training target K; included in the inference evaluation grid |
 | `MMRSAE_EVAL_TOPK` / `--eval-topk` | auto | Inference budget grid; each point uses the same trained checkpoint |
-| `MMRSAE_ANNEAL_START_K` / `--anneal-start-k` | min(h,max(64,4K)) | CSRv2 and DLMMSAEv2 initial training budget; templates explicitly select 64 |
-| `MMRSAE_ANNEAL_FRACTION` / `--anneal-fraction` | 0.7 | Fraction of CSRv2 and DLMMSAEv2 fitting used for cosine decay |
+| `MMRSAE_ANNEAL_START_K` / `--anneal-start-k` | min(h,max(64,4K)) | CSRv2 initial main K / MPSAEv2 initial auxiliary ka; templates select 64 |
+| `MMRSAE_ANNEAL_FRACTION` / `--anneal-fraction` | 0.7 | Fraction of updates for annealing: CSRv2 cosine main K, MPSAEv2 linear auxiliary OT K |
 | `MMRSAE_HIDDEN_DIM` / `--hidden-dim` | 8192 | Dictionary width |
-| `MMRSAE_REPAIR_RANK` / `--dictionary-rank` (alias `--repair-rank`) | 32 | Landmark-query adapter rank; the environment name is retained for compatibility |
+| `MMRSAE_REPAIR_RANK` / `--dictionary-rank` (alias `--repair-rank`) | 32 | Historical library query-adapter rank; inactive for selected methods |
 | `MMRSAE_DICTIONARY_TEMPERATURE` / `--dictionary-temperature` | 0.1 | Softmax temperature for input landmark lookup |
 | `MMRSAE_DICTIONARY_BLEND` / `--dictionary-blend` | 0.1 | Initial trainable mixture of landmark context into x; strictly between 0 and 1 |
-| `MMRSAE_CONTEXT_WEIGHT` / `--context-weight` | 1 for DLMMSAE, 0 otherwise | Direct raw-context relational KL weight |
+| `MMRSAE_CONTEXT_WEIGHT` / `--context-weight` | 0 for selected methods | Historical library context KL control; inactive here |
 | `MMRSAE_CONTEXT_REFERENCE_COUNT` / `--context-reference-count` | 1024 | Fixed fitting reference rows Q, disjoint from A; at least 3 |
 | `MMRSAE_CONTEXT_TEACHER_TEMPERATURE` / `--context-teacher-temperature` | 0.1 | Clean-input cosine profile temperature |
 | `MMRSAE_CONTEXT_STUDENT_TEMPERATURE` / `--context-student-temperature` | 0.1 | Raw-context cosine profile temperature |
@@ -303,8 +259,8 @@ require the CUDA retrieval check. No CPU execution mode is provided.
 | `MMRSAE_BATCH_SIZE` / `--batch-size` | 1024 | Compressor fitting batch |
 | `MMRSAE_TRAIN_SIZE` / `--train-size` | 128000 | Fitting/gallery rows; zero selects every eligible row after reserving anchors and dev queries |
 | `MMRSAE_DEV_SIZE` / `--dev-size` | 10000 | Training-derived development queries |
-| `MMRSAE_ANCHOR_COUNT` / `--anchor-count` | 1024 | Fixed input dictionary size and ordered training KL landmark bank |
-| `MMRSAE_BANK_REFRESH` / `--bank-refresh` | 25 | Periodic key refresh interval; training-K changes also force a refresh |
+| `MMRSAE_ANCHOR_COUNT` / `--anchor-count` | 1024 | Reserved training rows retained for split compatibility; unused by plain models |
+| `MMRSAE_BANK_REFRESH` / `--bank-refresh` | 25 | Historical library bank interval; no bank is refreshed by selected methods |
 | `MMRSAE_SEED` / `--seed` | 1227 | Model initialization, masking and fitting |
 | `MMRSAE_DATA_SEED` / `--data-seed` | 42 | Stable allocation/extraction across model-seed changes |
 | `MMRSAE_EVAL_EVERY` / `--eval-every` | 0 | Endpoint only; a positive completed-epoch interval adds gallery evaluations |
@@ -383,14 +339,10 @@ imagefolder`; raw ImageNet permissions are needed only for those image paths.
 
 Default `--evaluation dev` uses disjoint training-derived queries and does
 not download/open official validation. Labels allocate/evaluate the pools;
-reconstruction, landmark synthesis and neighborhood targets do not use class
-labels. The separate linear-probe evaluation does use fitting labels. Landmarks
+compressor reconstruction/OT/NCL objectives do not use class labels. The separate linear-probe evaluation does use fitting labels. Landmarks
 come from training and are reserved outside fitting/gallery even with unlimited
 training size. The sparse KL implementation still removes the minibatch's union
-of row IDs from its profiles if used outside this experiment recipe. DLMMSAE's
-Q comes only from fitting rows, with each query's own Q entry removed from both
-teacher and student profiles. Input landmark synthesis retains all A anchors
-in both training and inference.
+of row IDs from its profiles if used outside this experiment recipe. The selected plain-SAE methods do not construct Q or synthesize from A.
 
 Use `--evaluation official` explicitly for an official-validation measurement
 after choosing settings. Source/parent/recipe fingerprints remain in the
@@ -420,7 +372,7 @@ FP32 values without expanding the full gallery to width 8192. Chunked scores
 limit working memory while all gallery postings remain GPU-resident. Default
 query batch is 32, score budget 256 MiB, gallery chunk ceiling 65,536 rows and
 index memory fraction 0.8. CUDA-event and synchronized-wall search times are
-reported separately from landmark synthesis/SAE encoding and index construction. Timed search
+reported separately from SAE encoding and index construction. Timed search
 uses three warmups and five repetitions; reported time per query is amortized
 over the configured batch, not isolated single-query latency. A padded K=8
 indexed FP32 code uses 68 bytes before file metadata.
@@ -464,9 +416,8 @@ online monitoring failures are surfaced rather than silently disabling it.
 Resolved configuration, provenance, split identities, fitting history,
 checkpoints, retrieval metrics and per-query predictions are kept per run and
 backbone. A compatible restart restores model/optimizer, mask RNG, data order,
-landmark refresh state, training-time counter and update position. DLMMSAE also
-restores Q and its dedicated perturbation RNG; changed Q IDs/features are rejected.
-Its diagnostics use an independent RNG and do not advance training perturbations.
+landmark refresh state, training-time counter and update position. Selected plain-SAE methods need no Q bank or context RNG. Diagnostics do not mutate
+activity counters. The shared checkpoint format retains inactive compatibility fields.
 Reuse the same command/output
 directory to resume. A different recipe gets a different derived name unless
 one was specified; incompatible state under an explicit name is rejected.
@@ -476,13 +427,12 @@ Each evaluated budget writes `retrieval/endpoint/k_<K>/result.json`, metrics
 and predictions. `retrieval/endpoint/result.json` and the backbone summary
 contain `per_topk`, `evaluation_topk` and `budget_evaluation=single_checkpoint_multi_k`.
 Top-level retrieval fields remain the training-target-K point for older readers.
-This revision uses `mmrsae-imagenet-context-distillation-v4`; changed architecture,
+This revision uses `mmrsae-imagenet-mpsae-fixed-main-v5`; changed architecture,
 code and recipe identities prevent resuming a sparse-start or auxiliary-only
 annealing checkpoint as this method. Existing runs must keep their original
 implementation and identities; new experiments receive new derived run names.
 
 Source-level savings include bounded preparation/extraction, reusable parent
-features, indexed sparse reductions, batched independent OT solves, cached
-clean landmark keys and endpoint-only evaluation by default. These are design
+features, indexed sparse reductions, batched independent OT solves, shared pure Top-K gates and endpoint-only evaluation by default. These are design
 choices visible in the code; no speedup or accuracy result is claimed before
 execution. [VALIDATION.md](VALIDATION.md) records that limitation.

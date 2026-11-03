@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Tables and figures for CSR, CSRv2, DLMMSAE and DLMMSAEv2.
+"""Tables and figures for CSR, CSRv2, MPSAE and MPSAEv2.
 
 Trials are grouped by everything that defines a comparable experiment except
 the method (settings without ``variant``, plus the implementation identity), so
 a figure never mixes training K, data sizes, evaluation pools or code versions. Each
 group gets ``reports/<group>/`` with results.csv/results.md and PNG+PDF figures:
 top-1 versus inference K, endpoint top-1 by method, training loss, and support
-health. Other ablation methods are filtered out, and the legacy DLMMSAE annealed
-name is displayed as DLMMSAEv2. Failed or partial fits are reported from whatever they wrote; nothing here is trained,
+health. Other ablation methods are filtered out, and the MPSAE annealed alias
+is displayed as MPSAEv2; DLMMSAE trials are excluded. Failed or partial fits are reported from whatever they wrote; nothing here is trained,
 evaluated or downloaded, and it runs on CPU after any launcher invocation.
 """
 from __future__ import annotations
@@ -719,13 +719,16 @@ def report(output_dir, reports_dir=None):
         figures += plot_metric_panels(plt, group, target, "training_loss",
             [("loss_total", "Total loss (method-specific objective)", None, None),
              ("mse_final_K", "Reconstruction MSE (K)", None, None),
-             ("loss_context_unweighted", "Context relation KL (unweighted)", None, None),
-             ("weighted_context", "Weighted context loss", None, None)],
+             ("weighted_ot", "Weighted angular OT matching gap", None, None),
+             ("weighted_contrastive", "Weighted CSR contrastive loss", None, None)],
             f"Training objective · {subtitle}")
-        figures += plot_metric_panels(plt, group, target, "dictionary_and_schedule",
-            [("dictionary_blend", "Dictionary blend", None, (0, 1)),
-             ("training_k", "Training budget K", None, (0, k_limit))],
-            f"Dictionary contribution and K schedule · {subtitle}")
+        figures += plot_metric_panels(plt, group, target, "sparsity_schedule",
+            [("training_k", "Main reconstruction budget K", None, None),
+             ("annealing_k", "MPSAEv2 auxiliary budget k_a(t)", None, None),
+             ("ot_view_2k", "Second OT view budget", None, None),
+             ("ot_view_4k", "Third OT view budget", None, None),
+             ("auxiliary_budget", "Wide reconstruction budget", None, None)],
+            f"Main and auxiliary sparsity schedules · {subtitle}")
         figures += plot_metric_panels(plt, group, target, "support_health",
             [("actual_nnz_mean", "Mean positive coefficients", None, (0, k_limit)),
              ("final_nnz_min", "Min positive coefficients", None, (0, k_limit)),

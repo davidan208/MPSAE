@@ -1,4 +1,4 @@
-"""GPU-only ImageNet benchmark: CSR, CSRv2, DLMMSAE and DLMMSAEv2.
+"""GPU-only ImageNet benchmark: CSR, CSRv2, MPSAE and MPSAEv2.
 
 One selected variant and target K are fitted per requested backbone, then
 the same checkpoint is evaluated at each requested inference K. There is no
@@ -29,7 +29,7 @@ from wandb_tracking import (add_wandb_arguments, finish_wandb, init_wandb,
                             log_wandb_metrics, update_wandb_summary)
 
 
-PROTOCOL = "mmrsae-imagenet-context-distillation-v4"
+PROTOCOL = "mmrsae-imagenet-mpsae-fixed-main-v5"
 VARIANTS = BENCHMARK_METHODS
 SOURCE_FILES = ("mmrsae_imagenet.py", "mmrsae_methods.py", "mmrsae.py", "mmrsae_dictionary.py", "dlmmsae.py", "mmrsae_probe.py", "mmrsae_data.py", "mmrsae_gpu.py",
                 "mpsae_repair.py", "repair_data.py", "repair_runtime.py", "repair_benchmark.py",
@@ -40,14 +40,14 @@ SOURCE_FILES = ("mmrsae_imagenet.py", "mmrsae_methods.py", "mmrsae.py", "mmrsae_
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--backbones", default="resnet50,resnet18")
-    parser.add_argument("--variant", type=canonical_method, choices=VARIANTS, default="dlmmsae")
+    parser.add_argument("--variant", type=canonical_method, choices=VARIANTS, default="mpsae")
     parser.add_argument("--k", type=int, default=8)
     parser.add_argument("--eval-topk", default="auto",
                         help="Comma-separated inference budgets, or auto: 2,4,8,16,... up to parent dimension; training K is always included")
     parser.add_argument("--anneal-start-k", type=int,
-                        help="CSRv2/DLMMSAEv2 initial training K; default min(hidden_dim,max(64,4*K))")
+                        help="CSRv2 initial main K / MPSAEv2 initial auxiliary OT K; default min(hidden_dim,max(64,4*K))")
     parser.add_argument("--anneal-fraction", type=float, default=.7,
-                        help="Fraction of annealed-method updates used for half-cosine training-K decay")
+                        help="Annealing fraction: CSRv2 cosine main K; MPSAEv2 linear auxiliary OT K")
     parser.add_argument("--hidden-dim", type=int, default=8192)
     parser.add_argument("--dictionary-rank", "--repair-rank", dest="repair_rank", type=int, default=32,
                         help="Rank of the landmark-query adapter; --repair-rank is a compatibility alias")
@@ -579,7 +579,7 @@ def fit_and_evaluate(args, backbone, bundle, output, code, gpu, *, failure_conte
 
     def save(position):
         torch.cuda.synchronize(device)
-        save_checkpoint(checkpoint, {"format": "mmrsae-imagenet-v4", "identity": fit_recipe,
+        save_checkpoint(checkpoint, {"format": "mmrsae-imagenet-v5", "identity": fit_recipe,
             "model": model.state_dict(), "optimizer": pack_adam(optimizer, named),
             "rng": rng_state(mask_generator=masks), "bank": None if bank is None else bank.state_dict(),
             "context_bank": None if context_bank is None else context_bank.state_dict(),
@@ -636,7 +636,11 @@ def fit_and_evaluate(args, backbone, bundle, output, code, gpu, *, failure_conte
                     row.update({"gpu_allocated_mib": torch.cuda.memory_allocated(device) / 2**20,
                                 "gpu_peak_allocated_mib": torch.cuda.max_memory_allocated(device) / 2**20})
                     log_wandb_metrics("train", row, step_metric="step")
+                    ot_schedule = (f"k_a={row['annealing_k']} OT=({row['ot_view_k']},"
+                                   f"{row['ot_view_2k']},{row['ot_view_4k']}) "
+                                   if "annealing_k" in row else "")
                     print(f"{backbone} {args.variant} K={row['training_k']} target_K={args.k} update={next_step}/{total} "
+                          f"{ot_schedule}"
                           f"loss={row['loss_total']:.6f} nnz_min={row['final_nnz_min']} "
                           f"zero_codes={row['zero_final_codes']} GPU={row['gpu_allocated_mib']:.0f}MiB", flush=True)
                 at_epoch_end = next_step % per_epoch == 0
@@ -712,7 +716,12 @@ def main(argv=None):
                           "evaluation_topk": {name: evaluation_budgets(args, 2048 if name == "resnet50" else 512) for name in backbones},
                           "budget_evaluation": "single_checkpoint_multi_k",
                           "ot_cost": "none" if args.variant in ("csr", "csrv2", "mmrsae-rel") or args.ot_weight == 0 else "angular",
-                          "context_distillation": args.variant.startswith("dlmmsae") and args.context_weight != 0,
+                          "context_distillation": False,
+                          "sparsity_schedule": {"type": "fixed-main-linear-ot" if args.variant == "mpsaev2" else ("cosine-main" if args.variant == "csrv2" else "fixed"),
+                              "target_k": args.k, "start_k": args.anneal_start_k if args.anneal_start_k is not None else min(args.hidden_dim, max(64, 4 * args.k)),
+                              "anneal_steps": max(1, math.ceil(args.anneal_fraction * updates)),
+                              "fixed_reconstruction": args.variant != "csrv2",
+                              "ot_views": ["K*", "min(h,2*k_a(t))", "min(h,4*k_a(t))"] if args.variant == "mpsaev2" else None},
                           "training_time_scope": TRAINING_TIME_SCOPE,
                           "linear_probe": {"enabled": args.linear_probe, "epochs": args.probe_epochs,
                               "one_classifier_per_inference_k": True, "full_parent_classifier": True,
@@ -735,7 +744,7 @@ def main(argv=None):
     gpu = preflight(args.device, {"model": {"hidden_dim": args.hidden_dim, "k": max_eval_k,
                     "rank": args.repair_rank, "anchor_count": args.anchor_count,
                     "context_reference_count": args.context_reference_count if args.variant.startswith("dlmmsae") and args.context_weight != 0 else 0,
-                    "landmark_dictionary": args.variant not in ("mpsae", "csr", "csrv2")},
+                    "landmark_dictionary": args.variant not in ("mpsae", "mpsaev2", "csr", "csrv2")},
                    "retrieval": retrieval_config(args), "dense_reference": args.dense_reference},
                     gallery_rows_estimate=expected_gallery, input_dim=largest_dim)
     if args.preflight_only:
