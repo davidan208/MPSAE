@@ -195,7 +195,7 @@ class ProbeAggregationTests(unittest.TestCase):
             path = "run/classification/endpoint/result.json"
             partial = files.files[path]
             self.assertFalse(partial["complete"])
-            self.assertEqual(set(partial["per_topk"]), {"2"})
+            self.assertEqual(set(partial["per_topk"]), {"4"})
             self.assertTrue(model.training)
             complete = probe.evaluate_linear_probes(args, bundle, model, "run", "fixed-checkpoint")
             self.assertTrue(complete["complete"])
@@ -208,9 +208,10 @@ class ProbeAggregationTests(unittest.TestCase):
             self.assertEqual(complete, repeated)
             with self.assertRaisesRegex(ValueError, "different experiment"):
                 probe.evaluate_linear_probes(args, bundle, model, "run", "changed-checkpoint")
-        self.assertEqual([k for k, _, _ in calls], [2, 4, 4, None])
+        # Largest budget first; the interrupted K=2 head is refit on resume.
+        self.assertEqual([k for k, _, _ in calls], [4, 2, 2, None])
         self.assertEqual([width for _, _, width in calls], [8, 8, 8, 4])
-        self.assertTrue(calls[0][1].endswith("/2/last.pt"))
+        self.assertTrue(calls[0][1].endswith("/4/last.pt"))
         self.assertTrue(calls[-1][1].endswith("/full_parent/last.pt"))
         self.assertEqual(complete["per_topk"]["2"]["actual_nnz_mean"], 2.)
         # Dense representation width is not a measured nonzero count.

@@ -175,6 +175,12 @@ def preflight(device, config, *, gallery_rows_estimate=0, input_dim=2048):
                 raise ValueError(f"model.{name} must be a positive integer")
     score_cap = int(settings.get("score_buffer_mib", 256)) * 2**20
     query_batch = int(settings.get("query_batch_size", 32))
+    # Budgets >= dense_gemm_min_k use blocked GEMM (repair_benchmark), so the
+    # largest resident sparse index belongs to the largest budget below it.
+    dense_gemm_min_k = int(settings.get("dense_gemm_min_k", 0))
+    dense_gemm = 0 < dense_gemm_min_k <= k
+    if dense_gemm:
+        k = dense_gemm_min_k - 1 if dense_gemm_min_k > 1 else 1
     chunk_rows = min(int(settings.get("gallery_chunk_size", 65536)),
                      (4 * 2**20) // k, score_cap // (4 * query_batch))
     if chunk_rows < 1:
@@ -213,8 +219,15 @@ def preflight(device, config, *, gallery_rows_estimate=0, input_dim=2048):
                 # input dictionary is included; the refreshed KL bank and full
                 # training/encoding activation footprint are not estimated here.
                 parameter_state_bytes = 16 * parameter_count
+                dense_gemm_bytes = 0
+                if dense_gemm:
+                    from repair_benchmark import DENSE_GEMM_GALLERY_CHUNK, DENSE_GEMM_QUERY_BLOCK
+                    # Dense resident queries (official validation: 50k rows), one
+                    # expanded gallery chunk and one score block.
+                    dense_gemm_bytes = 4 * width * (50_000 + DENSE_GEMM_GALLERY_CHUNK) + (
+                        4 * DENSE_GEMM_QUERY_BLOCK * DENSE_GEMM_GALLERY_CHUNK)
                 peak_bound = parameter_state_bytes + model_buffer_bytes + index_bytes + max(
-                    workspace_bytes, construction_bytes, attention_workspace_bytes)
+                    workspace_bytes, construction_bytes, attention_workspace_bytes, dense_gemm_bytes)
                 check_cuda_memory_budget(target, peak_bound, fraction,
                                          "MMRSAE parameters/Adam, input dictionary and sparse retrieval")
                 estimates = {"gallery_rows": rows, "sparse_index_upper_bytes": index_bytes,
