@@ -164,11 +164,18 @@ done
 # default reads prepared archives; --embedding-source legacy explicitly enables
 # the old RN18 exporter with the same resolved CLI/environment settings.
 # Completed fits are copied (results, logs, weights-only final model) into a
-# compact archive after every method; resume state and caches are left behind.
+# compact archive after every method, before the next one starts. With
+# MMRSAE_PRUNE=1 (default) their encoded caches and probe checkpoints are then
+# deleted, so disk use stays near one method's working set.
 archive_dir="${MMRSAE_ARCHIVE_DIR:-${report_dir%/}_archive}"
+case "${MMRSAE_PRUNE:-1}" in
+    1) prune=(--prune) ;;
+    0) prune=() ;;
+    *) echo "MMRSAE_PRUNE must be 0 or 1" >&2; exit 2 ;;
+esac
 case "${MMRSAE_ARCHIVE:-$make_report}" in
     1) archive_results() { "$python_bin" "$SCRIPT_DIR/mmrsae_archive.py" --output-dir "$report_dir" \
-           --archive-dir "$archive_dir" || echo "MMRSAE archive failed; fit results are unaffected" >&2; } ;;
+           --archive-dir "$archive_dir" "${prune[@]}" || echo "MMRSAE archive failed; fit results are unaffected" >&2; } ;;
     0) archive_results() { :; } ;;
     *) echo "MMRSAE_ARCHIVE must be 0 or 1" >&2; exit 2 ;;
 esac

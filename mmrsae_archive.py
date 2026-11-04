@@ -7,7 +7,12 @@ the archive): every JSON/JSONL/TXT record and predictions.csv, and a weights-onl
 resume state (optimizer, RNG), linear-probe checkpoints, encoded caches and
 other ``.npy`` arrays, all regenerable from the final weights.
 
-    python mmrsae_archive.py --output-dir runs/mmrsae --archive-dir runs/mmrsae_archive
+With --prune, an archived completed fit is then slimmed in the run directory:
+encoded caches and linear-probe checkpoints are deleted (the bulk: ~40 GB per
+ResNet-50 fit). last.pt, records and row-ID arrays stay, so a rerun still
+recognises the completed evaluation instead of recomputing it.
+
+    python mmrsae_archive.py --output-dir runs/mmrsae --archive-dir runs/mmrsae_archive --prune
 """
 from __future__ import annotations
 
@@ -63,9 +68,22 @@ def _final_weights(checkpoint, target, checkpoint_sha256):
     return True
 
 
-def archive(output_dir, archive_dir):
+def _prune(directory):
+    """Delete regenerable bulk of one completed, archived backbone; return freed bytes."""
+    freed = 0
+    for cache in sorted(directory.rglob("encoded_cache")):
+        if cache.is_dir():
+            freed += sum(path.stat().st_size for path in cache.rglob("*") if path.is_file())
+            shutil.rmtree(cache)
+    for checkpoint in sorted((directory / "classification").glob("*/*/last.pt")):
+        freed += checkpoint.stat().st_size
+        checkpoint.unlink()
+    return freed
+
+
+def archive(output_dir, archive_dir, prune=False):
     output_dir, archive_dir = Path(output_dir), Path(archive_dir)
-    archived = []
+    archived, freed = [], 0
     for trial_path in sorted(output_dir.glob("*/trial.json")):
         trial = trial_path.parent
         destination = archive_dir / trial.name
@@ -85,6 +103,9 @@ def archive(output_dir, archive_dir):
                                summary.get("checkpoint_sha256"))
             for best in sorted(directory.glob("best*.pt")):
                 _copy(best, destination / backbone / best.name)
+            # Reached only after every record copied and the weights verified.
+            if prune:
+                freed += _prune(directory)
             complete.append(backbone)
         if complete:
             for name in ("trial.json", "configuration.json", "gpu_preflight.json"):
@@ -96,17 +117,20 @@ def archive(output_dir, archive_dir):
         for path in sorted(reports.rglob("*")):
             if path.is_file():
                 _copy(path, archive_dir / "reports" / path.relative_to(reports))
-    return archived
+    return archived, freed
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--output-dir", type=Path, default=Path("runs/mmrsae"))
     parser.add_argument("--archive-dir", type=Path, help="Default: <output-dir>_archive")
+    parser.add_argument("--prune", action="store_true",
+                        help="After archiving, delete encoded caches and probe checkpoints of completed fits")
     args = parser.parse_args(argv)
     archive_dir = args.archive_dir or args.output_dir.with_name(args.output_dir.name + "_archive")
-    archived = archive(args.output_dir, archive_dir)
-    print(f"MMRSAE archive: {archive_dir} ({len(archived)} trials with completed fits)", flush=True)
+    archived, freed = archive(args.output_dir, archive_dir, prune=args.prune)
+    print(f"MMRSAE archive: {archive_dir} ({len(archived)} trials with completed fits"
+          + (f"; pruned {freed / 2**30:.1f} GiB from {args.output_dir})" if args.prune else ")"), flush=True)
     return 0
 
 
