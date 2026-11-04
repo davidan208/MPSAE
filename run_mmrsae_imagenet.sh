@@ -147,15 +147,16 @@ for argument in "$@"; do
     previous="$argument"
 done
 # Resolve and validate the entire selection before starting any GPU work.
+# The supported list is mmrsae_methods.BENCHMARK_METHODS: a method added there
+# is accepted here, trained, skipped when complete and compared in reports.
+supported=" $(cd "$SCRIPT_DIR" && "$python_bin" -c 'from mmrsae_methods import BENCHMARK_METHODS; print(" ".join(BENCHMARK_METHODS))') "
 selected_variants=()
 declare -A seen_variants=()
 for variant in "${variants[@]}"; do
     variant="${variant// /}"
     [[ "$variant" != "mpsae-annealed" ]] || variant=mpsaev2
-    case "$variant" in
-        csr|csrv2|mpsae|mpsaev2) ;;
-        *) echo "Unsupported benchmark method '$variant'; choose csr,csrv2,mpsae,mpsaev2" >&2; exit 2 ;;
-    esac
+    [[ "$supported" == *" $variant "* ]] \
+        || { echo "Unsupported benchmark method '$variant'; choose one of:$supported" >&2; exit 2; }
     [[ -z "${seen_variants[$variant]:-}" ]] || { echo "Duplicate benchmark method: $variant" >&2; exit 2; }
     seen_variants[$variant]=1
     selected_variants+=("$variant")
